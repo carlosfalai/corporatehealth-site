@@ -99,7 +99,9 @@ async function sessionPaid(sessionId) {
   if (!stripe) return null; // fail closed — never open the upload gate without verifying payment
   try {
     const s = await stripe.checkout.sessions.retrieve(id);
-    if (s && s.payment_status === 'paid') return { id, sku: (s.metadata || {}).sku || null, email: (s.customer_details || {}).email || null, amount: s.amount_total };
+    // Only read payment_status + the product code. We deliberately do NOT read/keep customer_details
+    // (email/name) so this server holds no identifiable data.
+    if (s && s.payment_status === 'paid') return { id, sku: (s.metadata || {}).sku || null };
   } catch (_) {}
   return null;
 }
@@ -158,7 +160,7 @@ app.get('/upload', async (req, res) => {
       <input type="hidden" name="session_id" value="${esc(paid.id)}">
       <label>Your name<input name="contact_name" required></label>
       <label>Company<input name="company" required></label>
-      <label>Email for confirmation<input type="email" name="email" value="${esc(paid.email || '')}" required></label>
+      <label>Email for confirmation<input type="email" name="email" placeholder="you@company.com" required></label>
       ${fields}
       <button type="submit">${isRoster ? 'Submit roster securely' : 'Upload securely'}</button>
       <p id="msg"></p>
@@ -178,11 +180,12 @@ app.post('/api/upload-url', async (req, res) => {
   const reqFiles = Array.isArray((req.body || {}).files) ? req.body.files.slice(0, 40) : [];
   try {
     const files = [];
-    for (const f of reqFiles) {
-      const safe = String((f && f.name) || 'file').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
-      const key = prefix + Date.now() + '-' + crypto.randomBytes(3).toString('hex') + '-' + safe;
-      const url = await getSignedUrl(s3, new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, ContentType: (f && f.type) || 'application/octet-stream' }), { expiresIn: 900 });
-      files.push({ name: (f && f.name) || safe, key, url });
+    for (let i = 0; i < reqFiles.length; i++) {
+      const f = reqFiles[i] || {};
+      // opaque key — the original filename never reaches this server (it lives only in intake.json on S3)
+      const key = prefix + Date.now() + '-' + crypto.randomBytes(6).toString('hex') + '-' + i + '.bin';
+      const url = await getSignedUrl(s3, new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, ContentType: f.type || 'application/octet-stream' }), { expiresIn: 900 });
+      files.push({ key, url });
     }
     const intakeKey = prefix + 'intake.json';
     const intakeUrl = await getSignedUrl(s3, new PutObjectCommand({ Bucket: S3_BUCKET, Key: intakeKey, ContentType: 'application/json' }), { expiresIn: 900 });
@@ -225,7 +228,7 @@ if(f)f.addEventListener('submit',async e=>{
     const sid=f.session_id.value;
     const fi=f.querySelector('input[type=file]');
     const files=fi?[].slice.call(fi.files):[];
-    const meta=files.map(x=>({name:x.name,type:x.type||'application/octet-stream'}));
+    const meta=files.map(x=>({type:x.type||'application/octet-stream'}));
     // 1) server verifies payment + returns presigned S3 URLs (PHI never touches our server)
     const r=await fetch('/api/upload-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,files:meta})});
     const j=await r.json();
@@ -239,7 +242,7 @@ if(f)f.addEventListener('submit',async e=>{
     // 3) PUT the intake record (contact + roster + file keys) straight to S3
     const intake={session_id:sid,contact_name:f.contact_name.value,company:f.company.value,email:f.email.value,
       notes:f.notes?f.notes.value:null,roster:f.roster?f.roster.value:null,
-      files:j.files.map(x=>({name:x.name,key:x.key})),mode:j.mode,at:new Date().toISOString()};
+      files:files.map((x,i)=>({name:x.name,type:x.type,key:(j.files[i]||{}).key})),mode:j.mode,at:new Date().toISOString()};
     await fetch(j.intake.url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(intake)});
     m.style.color='#059669';m.textContent='✓ Received securely. We will reach out via Spruce and email to begin.';
     f.querySelectorAll('input,textarea,button').forEach(x=>x.disabled=true);
