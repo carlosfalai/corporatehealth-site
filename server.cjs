@@ -195,6 +195,9 @@ app.post('/api/upload-url', async (req, res) => {
   }
 });
 
+// Serve the page at /corporatehealth too, so www.instanthpi.ca/corporatehealth works (app owns the host).
+app.get(['/corporatehealth', '/corporatehealth/'], (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+
 // ---- static site LAST (so /upload and /api/* win) ----
 app.use(express.static(__dirname, { extensions: ['html'] }));
 
