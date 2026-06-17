@@ -6,10 +6,11 @@
 //      ca-central-1 (Loi 25 data residency) — see STORAGE note below. Keep this box behind HTTPS.
 
 const express = require('express');
-const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 // ---- env (reuse the global .env where the Stripe keys live) ----
 const ENV = {};
@@ -32,8 +33,14 @@ const LIVE = SECRET.startsWith('sk_live');
 let stripe = null;
 if (SECRET) { try { stripe = require('stripe')(SECRET); } catch (e) { console.log('stripe init failed', e.message); } }
 
-const DOSSIERS = path.join(__dirname, 'dossiers');
-fs.mkdirSync(DOSSIERS, { recursive: true });
+// PHI storage = AWS S3 in ca-central-1 under the AWS BAA (account 730335301855). PHI NEVER lands on
+// this server: the browser uploads straight to S3 via presigned URLs we only issue after payment.
+const S3_BUCKET = ENV.CORPHEALTH_S3_BUCKET || process.env.CORPHEALTH_S3_BUCKET || 'corporatehealth-phi-cac1';
+const S3_REGION = ENV.CORPHEALTH_S3_REGION || process.env.CORPHEALTH_S3_REGION || 'ca-central-1';
+const AWS_AK = ENV.AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID;
+const AWS_SK = ENV.AWS_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY;
+let s3 = null;
+if (AWS_AK && AWS_SK) { try { s3 = new S3Client({ region: S3_REGION, credentials: { accessKeyId: AWS_AK, secretAccessKey: AWS_SK } }); } catch (e) { console.log('s3 init failed', e.message); } }
 
 // ---- catalog: SKU -> { label, amount(cents, CAD), mode } ----
 // One-time per-case services use pay-then-upload. Annual bundles are also one-time charges here;
@@ -73,17 +80,8 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), (req,
       : JSON.parse(req.body);
   } catch (e) { return res.status(400).send('bad signature: ' + e.message); }
   if (event.type === 'checkout.session.completed') {
-    const s = event.data.object;
-    // mark the session paid in our local ledger so /upload can gate on it even if Stripe is slow
-    try {
-      const dir = path.join(DOSSIERS, sanitizeId(s.id));
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, 'paid.json'), JSON.stringify({
-        sessionId: s.id, sku: (s.metadata || {}).sku || null, amount: s.amount_total,
-        currency: s.currency, email: (s.customer_details || {}).email || null,
-        paidAt: new Date().toISOString()
-      }, null, 2));
-    } catch (_) {}
+    // No PHI/PII persisted on this server — the paid gate reads live from Stripe in sessionPaid().
+    console.log('paid:', (event.data.object || {}).id);
   }
   res.json({ received: true });
 });
@@ -98,15 +96,12 @@ function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ 
 async function sessionPaid(sessionId) {
   const id = sanitizeId(sessionId);
   if (!id) return null;
-  if (stripe) {
-    try {
-      const s = await stripe.checkout.sessions.retrieve(id);
-      if (s && s.payment_status === 'paid') return { id, sku: (s.metadata || {}).sku || null, email: (s.customer_details || {}).email || null, amount: s.amount_total };
-      return null;
-    } catch (_) { /* fall through to ledger */ }
-  }
-  // fallback: webhook-written ledger
-  try { const p = JSON.parse(fs.readFileSync(path.join(DOSSIERS, id, 'paid.json'), 'utf8')); return { id, sku: p.sku, email: p.email, amount: p.amount }; } catch (_) { return null; }
+  if (!stripe) return null; // fail closed — never open the upload gate without verifying payment
+  try {
+    const s = await stripe.checkout.sessions.retrieve(id);
+    if (s && s.payment_status === 'paid') return { id, sku: (s.metadata || {}).sku || null, email: (s.customer_details || {}).email || null, amount: s.amount_total };
+  } catch (_) {}
+  return null;
 }
 
 // ---- create a Checkout Session ----
@@ -159,7 +154,7 @@ app.get('/upload', async (req, res) => {
     <span class="ok">✓ Payment received</span>
     <h1>${heading}</h1>
     <p class="sub">${sub}</p>
-    <form id="f" method="post" action="/api/upload" enctype="multipart/form-data">
+    <form id="f" autocomplete="off" onsubmit="return false">
       <input type="hidden" name="session_id" value="${esc(paid.id)}">
       <label>Your name<input name="contact_name" required></label>
       <label>Company<input name="company" required></label>
@@ -171,35 +166,30 @@ app.get('/upload', async (req, res) => {
   </div>`) + uploadScript());
 });
 
-// ---- accept the upload (re-verify paid; store under the session id) ----
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const id = sanitizeId((req.body || {}).session_id);
-    const dir = path.join(DOSSIERS, id || ('orphan_' + crypto.randomBytes(4).toString('hex')));
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const safe = (file.originalname || 'file').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
-    cb(null, Date.now() + '_' + safe);
-  }
-});
-const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024, files: 40 } });
-
-app.post('/api/upload', upload.array('files', 40), async (req, res) => {
+// ---- issue presigned S3 PUT URLs (re-verify paid first) ----
+// The browser PUTs files + the intake record STRAIGHT to S3 (ca-central-1, BAA). This server only
+// signs the URLs — it never receives the PHI bytes. Fails closed if payment unverified or S3 absent.
+app.post('/api/upload-url', async (req, res) => {
   const paid = await sessionPaid((req.body || {}).session_id);
   if (!paid) return res.status(402).json({ ok: false, error: 'payment not verified — upload rejected' });
-  const id = sanitizeId(req.body.session_id);
-  const files = (req.files || []).map(f => ({ name: f.originalname, stored: path.basename(f.path), size: f.size }));
+  if (!s3) return res.status(503).json({ ok: false, error: 'secure storage not configured' });
+  const id = sanitizeId((req.body || {}).session_id);
+  const prefix = 'intake/' + id + '/';
+  const reqFiles = Array.isArray((req.body || {}).files) ? req.body.files.slice(0, 40) : [];
   try {
-    fs.writeFileSync(path.join(DOSSIERS, id, 'intake.json'), JSON.stringify({
-      sessionId: id, sku: paid.sku, mode: ROSTER_SKUS.has(paid.sku) ? 'roster' : 'dossier',
-      contact_name: req.body.contact_name, company: req.body.company,
-      email: req.body.email, notes: req.body.notes || null, roster: req.body.roster || null,
-      files, uploadedAt: new Date().toISOString()
-    }, null, 2));
-  } catch (_) {}
-  res.json({ ok: true, received: files.length, files: files.map(f => f.name) });
+    const files = [];
+    for (const f of reqFiles) {
+      const safe = String((f && f.name) || 'file').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
+      const key = prefix + Date.now() + '-' + crypto.randomBytes(3).toString('hex') + '-' + safe;
+      const url = await getSignedUrl(s3, new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, ContentType: (f && f.type) || 'application/octet-stream' }), { expiresIn: 900 });
+      files.push({ name: (f && f.name) || safe, key, url });
+    }
+    const intakeKey = prefix + 'intake.json';
+    const intakeUrl = await getSignedUrl(s3, new PutObjectCommand({ Bucket: S3_BUCKET, Key: intakeKey, ContentType: 'application/json' }), { expiresIn: 900 });
+    res.json({ ok: true, mode: ROSTER_SKUS.has(paid.sku) ? 'roster' : 'dossier', files, intake: { key: intakeKey, url: intakeUrl } });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ---- static site LAST (so /upload and /api/* win) ----
@@ -227,19 +217,41 @@ button:hover{background:#1E40AF}button:disabled{opacity:.6}
 function uploadScript() {
   return `<script>
 const f=document.getElementById('f');
-if(f)f.addEventListener('submit',async e=>{e.preventDefault();const b=f.querySelector('button'),m=document.getElementById('msg');const orig=b.textContent;
-b.disabled=true;b.textContent='Sending…';m.textContent='';
-try{const r=await fetch('/api/upload',{method:'POST',body:new FormData(f)});const j=await r.json();
-if(j.ok){m.style.color='#059669';m.textContent='✓ Received — thank you. We will reach out via Spruce and email to begin.';f.querySelectorAll('input,textarea,button').forEach(x=>x.disabled=true);}
-else{m.style.color='#DC2626';m.textContent='✕ '+(j.error||'submission failed');b.disabled=false;b.textContent=orig;}}
-catch(err){m.style.color='#DC2626';m.textContent='✕ '+err.message;b.disabled=false;b.textContent=orig;}});
+if(f)f.addEventListener('submit',async e=>{
+  e.preventDefault();
+  const b=f.querySelector('button'),m=document.getElementById('msg');const orig=b.textContent;
+  b.disabled=true;b.textContent='Sending…';m.textContent='';m.style.color='#64748B';
+  try{
+    const sid=f.session_id.value;
+    const fi=f.querySelector('input[type=file]');
+    const files=fi?[].slice.call(fi.files):[];
+    const meta=files.map(x=>({name:x.name,type:x.type||'application/octet-stream'}));
+    // 1) server verifies payment + returns presigned S3 URLs (PHI never touches our server)
+    const r=await fetch('/api/upload-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,files:meta})});
+    const j=await r.json();
+    if(!j.ok) throw new Error(j.error||'could not authorize upload');
+    // 2) PUT each file straight to S3 (ca-central-1)
+    for(let i=0;i<files.length;i++){
+      m.textContent='Uploading '+(i+1)+' / '+files.length+'…';
+      const pr=await fetch(j.files[i].url,{method:'PUT',headers:{'Content-Type':files[i].type||'application/octet-stream'},body:files[i]});
+      if(!pr.ok) throw new Error('upload failed for '+files[i].name);
+    }
+    // 3) PUT the intake record (contact + roster + file keys) straight to S3
+    const intake={session_id:sid,contact_name:f.contact_name.value,company:f.company.value,email:f.email.value,
+      notes:f.notes?f.notes.value:null,roster:f.roster?f.roster.value:null,
+      files:j.files.map(x=>({name:x.name,key:x.key})),mode:j.mode,at:new Date().toISOString()};
+    await fetch(j.intake.url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(intake)});
+    m.style.color='#059669';m.textContent='✓ Received securely. We will reach out via Spruce and email to begin.';
+    f.querySelectorAll('input,textarea,button').forEach(x=>x.disabled=true);
+  }catch(err){m.style.color='#DC2626';m.textContent='✕ '+err.message;b.disabled=false;b.textContent=orig;}
+});
 </script>`;
 }
 
 app.listen(PORT, () => {
   console.log(`CorporateHealth on ${SITE} (port ${PORT})`);
   console.log(`  billing: ${stripe ? (LIVE ? 'Stripe LIVE ⚠' : 'Stripe TEST') : 'DISABLED (no key)'} | webhook: ${WEBHOOK_SECRET ? 'verified' : 'UNVERIFIED (set CORPHEALTH_STRIPE_WEBHOOK_SECRET)'}`);
-  console.log(`  dossiers -> ${DOSSIERS}  (DEV ONLY — move to S3 ca-central-1 for Loi 25 before go-live)`);
+  console.log(`  PHI: ${s3 ? ('S3 ' + S3_BUCKET + ' @ ' + S3_REGION + ' (AWS BAA)') : 'DISABLED (no AWS creds)'} — presigned browser→S3, none stored on this host`);
 });
 
 module.exports = { app, sessionPaid, CATALOG };
