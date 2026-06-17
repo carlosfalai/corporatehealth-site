@@ -1,0 +1,10 @@
+node_modules/
+dossiers/
+.env
+*.log
+preview.png
+# keep pricing/legal/strategy + panel scripts local only
+panel-*.md
+price-*.md
+panel*.cjs
+*.local.json

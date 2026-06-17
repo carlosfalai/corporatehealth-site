@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: corporatehealth
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node server.cjs
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      # Set in Render dashboard / via API (never commit): STRIPE_SECRET_KEY, STRIPE_PUBLIC_KEY,
+      # CORPHEALTH_SITE_URL (the live https URL), CORPHEALTH_STRIPE_WEBHOOK_SECRET.

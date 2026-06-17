@@ -1,0 +1,15 @@
+{
+  "name": "corporatehealth-site",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CorporateHealth — pay-first then gated dossier upload (Stripe + Express)",
+  "main": "server.cjs",
+  "scripts": {
+    "start": "node server.cjs"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^2.2.0",
+    "stripe": "^16.0.0"
+  }
+}
